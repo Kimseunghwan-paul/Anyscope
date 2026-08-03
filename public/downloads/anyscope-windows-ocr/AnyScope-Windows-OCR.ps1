@@ -1,5 +1,5 @@
 ﻿param(
-  [string]$SiteUrl = "https://YOUR-NEW-SITE.chatgpt.site",
+  [string]$SiteUrl = "https://anyscope-independent-20260803.chatgpt.site",
   [string]$TargetDocumentId = "",
   [string]$LaunchUrl = "",
   [string]$LaunchToken = "",
