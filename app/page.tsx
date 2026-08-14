@@ -75,6 +75,8 @@ type SearchHit = {
   snippet: string;
   matchedTerms: string[];
   reasons: { label: string; value: number; strong?: boolean }[];
+  bm25fRaw?: number;
+  scoreCap?: number;
 };
 
 type SearchMode = "and" | "or";
@@ -367,7 +369,71 @@ function minimumConceptSpan(groupPositions: number[][]) {
   return minimum;
 }
 
-export function scoreRecord(record: CorpusRecord, query: string, searchMode: SearchMode = "and"): SearchHit | null {
+type Bm25fField = "title" | "section" | "file_name" | "document_type" | "body";
+type Bm25fCorpusStats = {
+  documentCount: number;
+  averageFieldLengths: Record<Bm25fField, number>;
+  documentFrequency: Map<string, number>;
+};
+
+const BM25F_FIELDS: { name: Bm25fField; weight: number; lengthNormalization: number }[] = [
+  { name: "title", weight: 3, lengthNormalization: .2 },
+  { name: "section", weight: 2.2, lengthNormalization: .25 },
+  { name: "file_name", weight: 1.4, lengthNormalization: .2 },
+  { name: "document_type", weight: 1.2, lengthNormalization: .2 },
+  { name: "body", weight: 1, lengthNormalization: .75 },
+];
+
+function bm25fFieldText(record: CorpusRecord, field: Bm25fField) {
+  return normalize(record[field] ?? "");
+}
+
+export function buildBm25fCorpusStats(records: CorpusRecord[], query: string): Bm25fCorpusStats {
+  const terms = [...new Set(buildRequiredConceptGroups(query).flatMap((group) => group.terms))];
+  const fieldLengthTotals = Object.fromEntries(BM25F_FIELDS.map(({ name }) => [name, 0])) as Record<Bm25fField, number>;
+  const documentFrequency = new Map(terms.map((term) => [term, 0]));
+  for (const record of records) {
+    const fields = Object.fromEntries(BM25F_FIELDS.map(({ name }) => {
+      const text = bm25fFieldText(record, name);
+      fieldLengthTotals[name] += Math.max(1, tokenize(text).length);
+      return [name, text];
+    })) as Record<Bm25fField, string>;
+    for (const term of terms) {
+      if (BM25F_FIELDS.some(({ name }) => containsTerm(fields[name], term))) {
+        documentFrequency.set(term, (documentFrequency.get(term) ?? 0) + 1);
+      }
+    }
+  }
+  const documentCount = Math.max(1, records.length);
+  return {
+    documentCount,
+    averageFieldLengths: Object.fromEntries(BM25F_FIELDS.map(({ name }) => [name, Math.max(1, fieldLengthTotals[name] / documentCount)])) as Record<Bm25fField, number>,
+    documentFrequency,
+  };
+}
+
+function bm25fScore(record: CorpusRecord, groups: QueryConceptGroup[], stats: Bm25fCorpusStats) {
+  const k1 = 1.2;
+  const fields = Object.fromEntries(BM25F_FIELDS.map(({ name }) => [name, bm25fFieldText(record, name)])) as Record<Bm25fField, string>;
+  const lengths = Object.fromEntries(BM25F_FIELDS.map(({ name }) => [name, Math.max(1, tokenize(fields[name]).length)])) as Record<Bm25fField, number>;
+  return groups.reduce((total, group) => {
+    const bestAliasScore = group.terms.reduce((best, term) => {
+      const weightedFrequency = BM25F_FIELDS.reduce((sum, { name, weight, lengthNormalization }) => {
+        const frequency = countOccurrences(fields[name], term);
+        const lengthFactor = 1 - lengthNormalization + lengthNormalization * lengths[name] / stats.averageFieldLengths[name];
+        return sum + weight * frequency / Math.max(.1, lengthFactor);
+      }, 0);
+      if (!weightedFrequency) return best;
+      const documentFrequency = stats.documentFrequency.get(term) ?? 0;
+      const inverseDocumentFrequency = Math.log(1 + (stats.documentCount - documentFrequency + .5) / (documentFrequency + .5));
+      const score = inverseDocumentFrequency * ((k1 + 1) * weightedFrequency) / (k1 + weightedFrequency);
+      return Math.max(best, score);
+    }, 0);
+    return total + bestAliasScore;
+  }, 0);
+}
+
+export function scoreRecord(record: CorpusRecord, query: string, searchMode: SearchMode = "and", bm25fStats?: Bm25fCorpusStats): SearchHit | null {
   const expanded = expandQuery(query);
   if (!expanded.normalized) return null;
   const title = normalize(record.title ?? "");
@@ -426,6 +492,8 @@ export function scoreRecord(record: CorpusRecord, query: string, searchMode: Sea
   if (score >= 85 && !(titlePoints >= 16 && proximityPoints >= 7 && frequencyPoints >= 4 && (normativePoints >= 5 || detailPoints >= 4))) score = 84;
   if (navigationRecord) score = Math.min(18, Math.max(10, Math.round(score * .22)));
   const rawScore = score;
+  const scoreCap = navigationRecord ? 18 : !sufficientBodyCoverage ? 42 : undefined;
+  const bm25fRaw = bm25fStats ? bm25fScore(record, expanded.requiredConceptGroups, bm25fStats) : undefined;
   const matchedTerms = allTerms.filter((term) => containsTerm(title, term) || containsTerm(section, term) || (bodyCounts[term] ?? 0) > 0);
   const reasons = [
     { label: navigationRecord ? "목차·참고문헌 감점" : "Clause 제목", value: Math.round(navigationRecord ? score : titlePoints), strong: !navigationRecord && titlePoints >= 16 },
@@ -434,7 +502,26 @@ export function scoreRecord(record: CorpusRecord, query: string, searchMode: Sea
     { label: "요구·수치 문맥", value: Math.round(normativePoints + detailPoints + substancePoints), strong: normativePoints >= 5 || detailPoints >= 4 },
     { label: "본문 용어 " + totalFrequency + "회", value: Math.round(frequencyPoints) },
   ].filter((reason) => reason.value > 0);
-  return { record, score, rawScore, snippet: makeSnippet(record.body, matchedTerms), matchedTerms, reasons };
+  return { record, score, rawScore, snippet: makeSnippet(record.body, matchedTerms), matchedTerms, reasons, bm25fRaw, scoreCap };
+}
+
+export function scoreRecords(records: CorpusRecord[], query: string, searchMode: SearchMode = "and") {
+  const stats = buildBm25fCorpusStats(records, query);
+  const hits = records.map((record) => scoreRecord(record, query, searchMode, stats))
+    .filter((hit): hit is SearchHit => Boolean(hit));
+  const maximumBm25f = Math.max(...hits.map((hit) => hit.bm25fRaw ?? 0), 0);
+  return hits.map((hit) => {
+    const bm25fPercent = maximumBm25f > 0 ? 100 * Math.log1p(hit.bm25fRaw ?? 0) / Math.log1p(maximumBm25f) : 0;
+    const hybridScore = Math.round(hit.score * .4 + bm25fPercent * .6);
+    const score = Math.min(100, hit.scoreCap ?? 100, hybridScore);
+    const bm25fPoints = Math.round(bm25fPercent * .6);
+    return {
+      ...hit,
+      score,
+      rawScore: score + (hit.bm25fRaw ?? 0) / 1000,
+      reasons: [{ label: "BM25F 필드·희소도", value: bm25fPoints, strong: bm25fPercent >= 80 }, ...hit.reasons],
+    };
+  });
 }
 
 type PdfHeading = {
@@ -809,8 +896,7 @@ export default function Home() {
 
   const searchHits = useMemo(() => {
     if (!records.length || !searchedQuery.trim()) return [];
-    const directHits = records.map((record) => scoreRecord(record, searchedQuery, searchedMode))
-      .filter((hit): hit is SearchHit => Boolean(hit));
+    const directHits = scoreRecords(records, searchedQuery, searchedMode);
     const hits = applyPdfContextScopes(records, directHits, searchedQuery, searchedMode).filter((hit) => {
         const typeId = resolveDocumentTypeId(hit.record, documentTypes);
         return activeTypeIds.has(typeId) && hit.score >= minScore;

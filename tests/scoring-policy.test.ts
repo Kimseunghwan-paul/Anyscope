@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyPdfContextScopes, isSentenceQuery, scoreRecord } from "../app/page";
+import { applyPdfContextScopes, isSentenceQuery, scoreRecord, scoreRecords } from "../app/page";
 
 function record(title: string, body: string, section = "PDF Page 1") {
   return {
@@ -37,6 +37,17 @@ test("keeps a single unqualified keyword occurrence in the low range", () => {
     "Liquefaction is discussed in the project.",
   ), "liquefaction");
   assert.ok(weak && weak.score <= 29);
+});
+
+test("BM25F ranks a title match above the same terms buried in a long body", () => {
+  const titleMatch = { ...record("Geotextile Drainage Requirements", "Geotextile drainage requirements shall apply."), id: "title-match" };
+  const bodyMatch = {
+    ...record("General Requirements", `${"general project information ".repeat(180)} geotextile drainage requirements shall apply.`),
+    id: "body-match",
+  };
+  const hits = scoreRecords([bodyMatch, titleMatch], "geotextile drainage").sort((left, right) => right.rawScore - left.rawScore);
+  assert.equal(hits[0]?.record.id, "title-match");
+  assert.ok(hits[0]?.reasons.some((reason) => reason.label.startsWith("BM25F")));
 });
 
 test("supports explicit OR search without weakening the default AND search", () => {
