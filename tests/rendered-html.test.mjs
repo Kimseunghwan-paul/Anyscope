@@ -814,6 +814,41 @@ test("generates a grounded Gemini report through the authenticated server route"
   }
 });
 
+test("searches KDS through the authenticated KCSC API route and caches responses", async () => {
+  const worker = await loadWorker();
+  const bucket = createBucket();
+  const env = { ...await environment(bucket), KCSC_API_KEY: "test-kcsc-key" };
+  const cookie = await bootstrapAdmin(worker, env);
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    calls.push(url);
+    assert.ok(url.includes("key=test-kcsc-key"));
+    if (url.includes("/CodeList")) return Response.json([
+      { codeType: "KDS", code: "142020", fullCode: "14142020", name: "콘크리트구조 휨 및 압축 설계기준", version: "2024", updateDate: "2024-12-30" },
+      { codeType: "KCS", code: "142010", name: "일반콘크리트" },
+    ]);
+    return Response.json([{ codeType: "KDS", code: "142020", name: "콘크리트구조 휨 및 압축 설계기준", version: "2024", list: [
+      { no: 1, sort: 1, title: "4.1 설계 일반", contents: "<p>콘크리트 압축강도와 휨강도는 설계기준을 만족하여야 한다.</p>" },
+    ] }]);
+  };
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const response = await worker.fetch(new Request("https://example.test/api/kds/search?q=콘크리트", { headers: { Cookie: cookie } }), env, context);
+      assert.equal(response.status, 200);
+      const payload = await response.json();
+      assert.equal(payload.catalog_count, 1);
+      assert.equal(payload.records[0].external_source, "kds");
+      assert.match(payload.records[0].body, /압축강도와 휨강도/);
+      assert.ok(!payload.records[0].body.includes("<p>"));
+    }
+    assert.equal(calls.length, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("explains an invalid Gemini key instead of returning a generic report error", async () => {
   const worker = await loadWorker();
   const env = { ...await environment(), GEMINI_API_KEY: "invalid-test-key", GEMINI_MODEL: "gemini-test-model" };

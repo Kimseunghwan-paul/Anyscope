@@ -41,6 +41,11 @@ type CorpusRecord = {
   ocr_status: "not_needed" | "pending" | "complete";
   ocr_confidence?: number;
   ocr_review_required?: boolean;
+  external_source?: "kds";
+  external_url?: string;
+  kds_code?: string;
+  kds_version?: string;
+  kds_updated_at?: string;
 };
 
 type DocumentInfo = {
@@ -658,6 +663,7 @@ export function applyPdfContextScopes(records: CorpusRecord[], directHits: Searc
 }
 
 function locationLabel(record: CorpusRecord) {
+  if (record.external_source === "kds") return record.kds_code ?? "KDS";
   if (record.source_kind === "pdf") {
     if (record.context_mode && record.context_pages) return `p. ${record.context_pages.from}–${record.context_pages.to}`;
     return "p. " + record.page;
@@ -759,6 +765,11 @@ export default function Home() {
   const [searchedQuery, setSearchedQuery] = useState("");
   const [searchMode, setSearchMode] = useState<SearchMode>("and");
   const [searchedMode, setSearchedMode] = useState<SearchMode>("and");
+  const [searchSource, setSearchSource] = useState<"all" | "library" | "kds">("all");
+  const [searchedSource, setSearchedSource] = useState<"all" | "library" | "kds">("all");
+  const [kdsRecords, setKdsRecords] = useState<CorpusRecord[]>([]);
+  const [kdsSearching, setKdsSearching] = useState(false);
+  const [kdsError, setKdsError] = useState("");
   const [activeTypeIds, setActiveTypeIds] = useState(new Set<string>());
   const [minScore, setMinScore] = useState(30);
   const [sort, setSort] = useState("score");
@@ -887,23 +898,27 @@ export default function Home() {
   );
 
   function typeDefinitionFor(source: DocumentInfo | CorpusRecord) {
+    if ("external_source" in source && source.external_source === "kds") return { ...UNCATEGORIZED_TYPE, name: "KDS 국가설계기준", color: "teal" as const };
     return documentTypeById.get(resolveDocumentTypeId(source, documentTypes)) ?? UNCATEGORIZED_TYPE;
   }
 
   function typeLabelFor(source: DocumentInfo | CorpusRecord) {
+    if ("external_source" in source && source.external_source === "kds") return "KDS 국가설계기준";
     return documentTypeLabel(resolveDocumentTypeId(source, documentTypes), documentTypes);
   }
 
   const searchHits = useMemo(() => {
-    if (!records.length || !searchedQuery.trim()) return [];
-    const directHits = scoreRecords(records, searchedQuery, searchedMode);
-    const hits = applyPdfContextScopes(records, directHits, searchedQuery, searchedMode).filter((hit) => {
+    if (!searchedQuery.trim()) return [];
+    const selectedRecords = searchedSource === "library" ? records : searchedSource === "kds" ? kdsRecords : [...records, ...kdsRecords];
+    const directHits = scoreRecords(selectedRecords, searchedQuery, searchedMode);
+    const hits = applyPdfContextScopes(selectedRecords, directHits, searchedQuery, searchedMode).filter((hit) => {
+        if (hit.record.external_source === "kds") return hit.score >= minScore;
         const typeId = resolveDocumentTypeId(hit.record, documentTypes);
         return activeTypeIds.has(typeId) && hit.score >= minScore;
       });
     hits.sort((a, b) => sort === "score" ? b.rawScore - a.rawScore : a.record.file_name.localeCompare(b.record.file_name));
     return hits;
-  }, [records, searchedQuery, searchedMode, activeTypeIds, documentTypes, minScore, sort]);
+  }, [records, kdsRecords, searchedQuery, searchedMode, searchedSource, activeTypeIds, documentTypes, minScore, sort]);
 
   const pageCount = Math.max(1, Math.ceil(searchHits.length / RESULTS_PER_PAGE));
   const displayPage = Math.min(currentPage, pageCount);
@@ -953,6 +968,7 @@ export default function Home() {
 
   const contextRecords = useMemo(() => {
     if (!viewer) return [];
+    if (viewer.external_source === "kds") return kdsRecords.filter((record) => record.document_id === viewer.document_id);
     if ((viewer.source_kind === "pdf" || viewer.source_kind === "word") && viewer.page) {
       const from = viewer.context_pages?.from ?? Math.max(1, viewer.page - 1);
       const to = viewer.context_pages?.to ?? viewer.page + 1;
@@ -962,14 +978,37 @@ export default function Home() {
     const sameSheet = records.filter((record) => record.document_id === viewer.document_id && record.source_kind === "excel" && record.sheet === viewer.sheet);
     const index = sameSheet.findIndex((record) => record.id === viewer.id);
     return sameSheet.slice(Math.max(0, index - 1), index + 2);
-  }, [viewer, records]);
+  }, [viewer, records, kdsRecords]);
+
+  async function executeSearch(nextQuery: string) {
+    const cleanQuery = nextQuery.trim();
+    setSearchedQuery(cleanQuery);
+    setSearchedMode(searchMode);
+    setSearchedSource(searchSource);
+    setSelected(new Set());
+    setCurrentPage(1);
+    setKdsError("");
+    if (!cleanQuery || searchSource === "library") {
+      setKdsRecords([]);
+      return;
+    }
+    setKdsSearching(true);
+    try {
+      const response = await fetch(`/api/kds/search?q=${encodeURIComponent(cleanQuery)}`, { cache: "no-store" });
+      const result = await response.json() as { records?: CorpusRecord[]; message?: string; detail?: string };
+      if (!response.ok) throw new Error(result.message || "KDS 검색에 실패했습니다.");
+      setKdsRecords(result.records ?? []);
+    } catch (error) {
+      setKdsRecords([]);
+      setKdsError(error instanceof Error ? error.message : "KDS 검색에 실패했습니다.");
+    } finally {
+      setKdsSearching(false);
+    }
+  }
 
   function submitSearch(event: FormEvent) {
     event.preventDefault();
-    setSearchedQuery(query.trim());
-    setSearchedMode(searchMode);
-    setSelected(new Set());
-    setCurrentPage(1);
+    void executeSearch(query);
   }
 
   async function handleLogin(event: FormEvent) {
@@ -1772,6 +1811,10 @@ export default function Home() {
   }
 
   function openFullOriginal(record: CorpusRecord) {
+    if (record.external_source === "kds" && record.external_url) {
+      window.open(record.external_url, "_blank", "noopener,noreferrer");
+      return;
+    }
     const page = record.page ? `#page=${record.page}` : "";
     window.open(`/api/documents/${encodeURIComponent(record.document_id)}${page}`, "_blank", "noopener,noreferrer");
   }
@@ -1898,6 +1941,11 @@ export default function Home() {
 
       <section className="hero real-corpus-hero">
         <p className="hero-search-description">영어와 한글 키워드·문장 검색</p>
+        <div className="search-source-selector" role="group" aria-label="검색 자료 범위">
+          <button type="button" className={searchSource === "all" ? "active" : ""} aria-pressed={searchSource === "all"} onClick={() => setSearchSource("all")}>전체</button>
+          <button type="button" className={searchSource === "library" ? "active" : ""} aria-pressed={searchSource === "library"} onClick={() => setSearchSource("library")}>내 문서</button>
+          <button type="button" className={searchSource === "kds" ? "active" : ""} aria-pressed={searchSource === "kds"} onClick={() => setSearchSource("kds")}>KDS 국가설계기준</button>
+        </div>
         <form className="search-box" onSubmit={submitSearch}>
           <span className="search-glyph" aria-hidden="true" />
           <input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="문서 검색" placeholder="찾고 싶은 내용을 키워드 또는 문장으로 입력하세요" />
@@ -1905,12 +1953,12 @@ export default function Home() {
             <button type="button" className={searchMode === "and" ? "active" : ""} aria-pressed={searchMode === "and"} onClick={() => setSearchMode("and")}>AND</button>
             <button type="button" className={searchMode === "or" ? "active" : ""} aria-pressed={searchMode === "or"} onClick={() => setSearchMode("or")}>OR</button>
           </div>
-          <button type="submit">검색</button>
+          <button type="submit" disabled={kdsSearching}>{kdsSearching ? "KDS 조회 중…" : "검색"}</button>
         </form>
         <div className="suggestions" aria-label="추천 검색어">
           <span>검색어 예시 :</span>
           {["Settlement", "Concrete Strength", "Termination", "Monitoring"].map((item) => (
-            <button key={item} onClick={() => { setQuery(item); setSearchedQuery(item); setSearchedMode(searchMode); setSelected(new Set()); setCurrentPage(1); }}>{item}</button>
+            <button key={item} onClick={() => { setQuery(item); void executeSearch(item); }}>{item}</button>
           ))}
         </div>
       </section>
@@ -1953,6 +2001,8 @@ export default function Home() {
             <div className="toolbar-actions"><select value={sort} onChange={(event) => { setSort(event.target.value); setCurrentPage(1); }} aria-label="정렬 순서"><option value="score">관련도 높은 순</option><option value="document">문서명 순</option></select><button type="button" className="excel-download-button" disabled={!searchHits.length} onClick={downloadSearchResultsExcel}>목록 내려받기</button><button type="button" className="summary-report-button" disabled={!searchHits.length} onClick={() => { setReportGenerated(false); setAiReport(null); setReportError(""); setReportOpen(true); }}>요약 보고서 만들기</button></div>
           </div>
           {loadError && <div className="system-error"><b>검색 데이터를 불러오지 못했습니다.</b><p>{loadError}</p></div>}
+          {kdsError && <div className="system-error"><b>KDS 데이터를 불러오지 못했습니다.</b><p>{kdsError}</p></div>}
+          {kdsSearching && <div className="loading-state"><span /><b>국가건설기준센터에서 관련 KDS 기준을 확인하는 중입니다</b></div>}
           {!manifest && !loadError && <div className="loading-state"><span /><b>실제 문서 색인을 불러오는 중입니다</b></div>}
 
           {paginatedHits.length > 0 && <div className="results-table-wrap">
@@ -1974,7 +2024,7 @@ export default function Home() {
             </table>
           </div>}
           {manifest && !searchedQuery.trim() && <div className="empty-state initial-empty-state"><span className="search-glyph" /><h3>검색어를 입력해 주세요</h3><p>한글 또는 영어 키워드와 문장으로 연결된 문서를 검색할 수 있습니다.</p></div>}
-          {manifest && searchedQuery.trim() && searchHits.length === 0 && <div className="empty-state"><span className="search-glyph" /><h3>현재 조건에 맞는 결과가 없습니다</h3><p>최소 관련도를 낮추거나 다른 문서 유형을 선택해 보세요. OCR 필요 페이지는 처리 전까지 검색되지 않습니다.</p><button onClick={() => { setMinScore(15); setCurrentPage(1); }}>관련도 15점으로 낮추기</button></div>}
+          {manifest && searchedQuery.trim() && !kdsSearching && searchHits.length === 0 && <div className="empty-state"><span className="search-glyph" /><h3>현재 조건에 맞는 결과가 없습니다</h3><p>{searchedSource === "kds" ? "KDS 코드나 기준명에 포함된 핵심 용어로 다시 검색해 보세요." : "최소 관련도를 낮추거나 다른 문서 유형을 선택해 보세요. OCR 필요 페이지는 처리 전까지 검색되지 않습니다."}</p><button onClick={() => { setMinScore(15); setCurrentPage(1); }}>관련도 15점으로 낮추기</button></div>}
           {searchHits.length > RESULTS_PER_PAGE && <nav className="pagination" aria-label="검색 결과 페이지"><button type="button" onClick={() => setCurrentPage(Math.max(1, displayPage - 1))} disabled={displayPage === 1}>이전</button><div>{visiblePages.map((page, index) => <span key={page}>{index > 0 && page - visiblePages[index - 1] > 1 && <i>…</i>}<button type="button" className={page === displayPage ? "active" : ""} aria-current={page === displayPage ? "page" : undefined} onClick={() => setCurrentPage(page)}>{page}</button></span>)}</div><button type="button" onClick={() => setCurrentPage(Math.min(pageCount, displayPage + 1))} disabled={displayPage === pageCount}>다음</button><small>{(displayPage - 1) * RESULTS_PER_PAGE + 1}–{Math.min(displayPage * RESULTS_PER_PAGE, searchHits.length)} / {searchHits.length}</small></nav>}
         </section>
       </section>

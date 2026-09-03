@@ -11,6 +11,7 @@ import {
   isSameOriginMutation,
   type AuthenticatedUser,
 } from "./identity";
+import { handleKdsRequest } from "./kds";
 
 interface Env {
   ASSETS: Fetcher;
@@ -19,6 +20,7 @@ interface Env {
   CLAUSESCOPE_PASSCODE?: string;
   GEMINI_API_KEY?: string;
   GEMINI_MODEL?: string;
+  KCSC_API_KEY?: string;
   IMAGES: {
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
@@ -1913,6 +1915,9 @@ const worker = {
 
     const reportResponse = await handleReportRequest(request, env, url, user);
     if (reportResponse) return reportResponse;
+
+    const kdsResponse = await handleKdsRequest(request, env, url);
+    if (kdsResponse) return kdsResponse;
 
     const documentTypeResponse = await handleDocumentTypeRequest(request, env, url, user);
     if (documentTypeResponse) return documentTypeResponse;
